@@ -3,8 +3,8 @@ import numpy as np
 
 config = edict()
 
-config.IMG_HEIGHT = 1242
-config.IMG_WIDTH = 375
+config.IMG_HEIGHT = 375
+config.IMG_WIDTH = 1242
 
 # TODO(shizehao): infer fea shape in run time
 config.FEA_HEIGHT = 12
@@ -69,6 +69,11 @@ config.ANCHOR_SHAPE = set_anchors(config.FEA_HEIGHT, config.FEA_WIDTH)
 config.NUM_ANCHORS = 9
 config.NUM_CLASSES = 3
 config.ANCHORS = config.NUM_ANCHORS * config.FEA_HEIGHT * config.FEA_WIDTH
+
+config.PLOT_PROB_THRESH = 0.4
+config.NMS_THRESH = 0.4
+config.PROB_THRESH = 0.005
+config.TOP_N_DETECTION = 64
 
 
 

@@ -25,8 +25,9 @@ from datasets import dataset_factory
 from deployment import model_deploy
 from nets import nets_factory
 from preprocessing import preprocessing_factory
-from nets.mobilenetdet import encode_annos, losses, set_anchors, interpre_prediction, \
-  scale_bboxes, bbox_transform_inv, rearrange_coords, yxyx_to_xywh_
+
+from utils.det_utils import encode_annos, losses, interpre_prediction
+
 from configs.kitti_config import config
 
 import tensorflow.contrib.slim as slim
@@ -458,35 +459,25 @@ def main(_):
       # Preprocesing
       # gt_bboxes = scale_bboxes(gt_bboxes, img_shape)  # bboxes format [0,1) for tf draw
 
-      gt_bboxes = tf.expand_dims(gt_bboxes, axis=0)
       image, gt_labels, gt_bboxes = image_preprocessing_fn(image,
                                                            config.IMG_HEIGHT,
                                                            config.IMG_WIDTH,
                                                            labels=gt_labels,
                                                            bboxes=gt_bboxes,
                                                            )
-      gt_bboxes = tf.reshape(gt_bboxes, tf.shape(gt_bboxes)[1:])
 
       #############################################
       # Encode annotations for losses computation #
       #############################################
 
       # anchors format [cx, cy, w, h]
-      anchors = set_anchors([config.IMG_HEIGHT, config.IMG_WIDTH], [config.FEA_HEIGHT, config.FEA_WIDTH])
+      anchors = tf.convert_to_tensor(config.ANCHOR_SHAPE, dtype=tf.float32)
 
-      print("images shape:", image.get_shape().as_list())
-      print("gt_labels shape:", gt_labels.get_shape().as_list())
-      print("gt_bboxes shape:", gt_bboxes.get_shape().as_list())
-      print("anchors shape:", anchors.get_shape().as_list())
-
-
-      input_mask, labels_input, box_delta_input, box_input = encode_annos(image,
-                                                                          gt_labels,
+      # encode annos, box_input format [cx, cy, w, h]
+      input_mask, labels_input, box_delta_input, box_input = encode_annos(gt_labels,
                                                                           gt_bboxes,
                                                                           anchors,
                                                                           config.NUM_CLASSES)
-
-      box_input = yxyx_to_xywh_(box_input)  # [ymin, xmin, ymax, xmax] -> [cx, cy, w, h]
 
       images, b_input_mask, b_labels_input, b_box_delta_input, b_box_input = tf.train.batch(
         [image, input_mask, labels_input, box_delta_input, box_input],
@@ -503,19 +494,27 @@ def main(_):
     def clone_fn(batch_queue):
       """Allows data parallelism by creating multiple clones of network_fn."""
       images, b_input_mask, b_labels_input, b_box_delta_input, b_box_input = batch_queue.dequeue()
+      anchors = tf.convert_to_tensor(config.ANCHOR_SHAPE, dtype=tf.float32)
       end_points = network_fn(images)
+      end_points["viz_images"] = images
       conv_ds_14 = end_points['MobileNet/conv_ds_14/depthwise_conv']
       dropout = slim.dropout(conv_ds_14, keep_prob=0.5, is_training=True)
-
       num_output = config.NUM_ANCHORS * (config.NUM_CLASSES + 1 + 4)
       predict = slim.conv2d(dropout, num_output, kernel_size=(3, 3), stride=1, padding='SAME',
-                            weights_initializer=tf.random_normal_initializer(stddev=0.0001),
+                            activation_fn=None,
+                            weights_initializer=tf.truncated_normal_initializer(stddev=0.0001),
                             scope="MobileNet/conv_predict")
 
-      anchors_ = tf.reshape(anchors, shape=[-1, 4])
-      pred_box_delta, pred_class_probs, pred_conf, ious, _, _, _ = \
-        interpre_prediction(predict, b_input_mask, anchors_, b_box_input, config.FEA_HEIGHT, config.FEA_WIDTH)
-      losses(b_input_mask, b_labels_input, ious, b_box_delta_input, pred_class_probs, pred_conf, pred_box_delta)
+      with tf.name_scope("Interpre_prediction") as scope:
+        pred_box_delta, pred_class_probs, pred_conf, ious, det_probs, det_boxes, det_class = \
+          interpre_prediction(predict, b_input_mask, anchors, b_box_input)
+        end_points["viz_det_probs"] = det_probs
+        end_points["viz_det_boxes"] = det_boxes
+        end_points["viz_det_class"] = det_class
+
+      with tf.name_scope("Losses") as scope:
+        losses(b_input_mask, b_labels_input, ious, b_box_delta_input, pred_class_probs, pred_conf, pred_box_delta)
+
       return end_points
 
     # Gather initial summaries.
@@ -530,10 +529,14 @@ def main(_):
     # Add summaries for end_points.
     end_points = clones[0].outputs
     for end_point in end_points:
-      x = end_points[end_point]
-      summaries.add(tf.summary.histogram('activations/' + end_point, x))
-      summaries.add(tf.summary.scalar('sparsity/' + end_point,
-                                      tf.nn.zero_fraction(x)))
+      if end_point not in ["viz_images", "viz_det_probs", "viz_det_boxes", "viz_det_class"]:
+        x = end_points[end_point]
+        summaries.add(tf.summary.histogram('activations/' + end_point, x))
+        summaries.add(tf.summary.scalar('sparsity/' + end_point,
+                                        tf.nn.zero_fraction(x)))
+
+    # Add summaries for det result TODO(shizehao): vizulize prediction
+
 
     # Add summaries for losses.
     for loss in tf.get_collection(tf.GraphKeys.LOSSES, first_clone_scope):
